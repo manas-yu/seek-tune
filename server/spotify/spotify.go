@@ -1,13 +1,17 @@
 package spotify
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"os"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -25,6 +29,7 @@ type Track struct {
 }
 
 const (
+	
 	tokenEndpoint       = "https://open.spotify.com/get_access_token?reason=transport&productType=web-player"
 	trackInitialPath    = "https://api-partner.spotify.com/pathfinder/v1/query?operationName=getTrack&variables="
 	playlistInitialPath = "https://api-partner.spotify.com/pathfinder/v1/query?operationName=fetchPlaylist&variables="
@@ -34,20 +39,45 @@ const (
 	albumEndPath        = `{"persistedQuery":{"version":1,"sha256Hash":"46ae954ef2d2fe7732b4b2b4022157b2e18b7ea84f70591ceb164e4de1b5d5d3"}}`
 )
 
-func accessToken() (string, error) {
-	resp, err := http.Get(tokenEndpoint)
+var 	clientID     = os.Getenv("clientID")
+var     clientSecret= os.Getenv("clientSecret")
+
+func getAccessToken() (string, error) {
+	data := url.Values{}
+	data.Set("grant_type", "client_credentials")
+
+	req, err := http.NewRequest("POST", "https://accounts.spotify.com/api/token", strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", err
+	}
+
+	// Base64 encode clientID:clientSecret
+	auth := base64.StdEncoding.EncodeToString([]byte(clientID + ":" + clientSecret))
+	req.Header.Add("Authorization", "Basic "+auth)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to get access token: %s", body)
+	}
+
+	var result struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&result)
 	if err != nil {
 		return "", err
 	}
 
-	accessToken := gjson.Get(string(body), "accessToken")
-	return accessToken.String(), nil
+	return result.AccessToken, nil
 }
 
 /* requests to playlist/track endpoints */
@@ -57,13 +87,14 @@ func request(endpoint string) (int, string, error) {
 		return 0, "", fmt.Errorf("error on making the request")
 	}
 
-	bearer, err := accessToken()
+	bearer, err := getAccessToken()
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to get access token: %w", err)
 	}
 	req.Header.Add("Authorization", "Bearer "+bearer)
 
 	resp, err := (&http.Client{}).Do(req)
+	fmt.Printf("%d",resp);
 	if err != nil {
 		return 0, "", fmt.Errorf("error on getting response: %w", err)
 	}
@@ -89,14 +120,13 @@ func isValidPattern(url, pattern string) bool {
 }
 
 func TrackInfo(url string) (*Track, error) {
-	trackPattern := `^https:\/\/open\.spotify\.com\/track\/[a-zA-Z0-9]{22}\?si=[a-zA-Z0-9]{16}$`
+	trackPattern := `^https:\/\/open\.spotify\.com\/track\/[a-zA-Z0-9]{22}(\?.*)?$`
 	if !isValidPattern(url, trackPattern) {
 		return nil, errors.New("invalid track url")
 	}
 
 	id := getID(url)
-	endpointQuery := EncodeParam(fmt.Sprintf(`{"uri":"spotify:track:%s"}`, id))
-	endpoint := trackInitialPath + endpointQuery + "&extensions=" + EncodeParam(trackEndPath)
+	endpoint := "https://api.spotify.com/v1/tracks/" + id
 
 	statusCode, jsonResponse, err := request(endpoint)
 	if err != nil {
@@ -107,68 +137,116 @@ func TrackInfo(url string) (*Track, error) {
 		return nil, fmt.Errorf("received non-200 status code: %d", statusCode)
 	}
 
-	var allArtists []string
+	// Now parse official Web API response structure
+	var track Track
+	track.Title = gjson.Get(jsonResponse, "name").String()
+	track.Album = gjson.Get(jsonResponse, "album.name").String()
+	track.Duration = int(gjson.Get(jsonResponse, "duration_ms").Int() / 1000)
 
-	if firstArtist := gjson.Get(jsonResponse, "data.trackUnion.firstArtist.items.0.profile.name").String(); firstArtist != "" {
-		allArtists = append(allArtists, firstArtist)
-	}
-
-	if artists := gjson.Get(jsonResponse, "data.trackUnion.otherArtists.items").Array(); len(artists) > 0 {
-		for _, artist := range artists {
-			if profile := artist.Get("profile").Map(); len(profile) > 0 {
-				if name := profile["name"].String(); name != "" {
-					allArtists = append(allArtists, name)
-				}
-			}
+	artists := gjson.Get(jsonResponse, "artists").Array()
+	for _, artist := range artists {
+		name := artist.Get("name").String()
+		if name != "" {
+			track.Artists = append(track.Artists, name)
 		}
 	}
-
-	durationInSeconds := int(gjson.Get(jsonResponse, "data.trackUnion.duration.totalMilliseconds").Int())
-	durationInSeconds = durationInSeconds / 1000
-
-	track := &Track{
-		Title:    gjson.Get(jsonResponse, "data.trackUnion.name").String(),
-		Artist:   gjson.Get(jsonResponse, "data.trackUnion.firstArtist.items.0.profile.name").String(),
-		Artists:  allArtists,
-		Duration: durationInSeconds,
-		Album:    gjson.Get(jsonResponse, "data.trackUnion.albumOfTrack.name").String(),
+	if len(track.Artists) > 0 {
+		track.Artist = track.Artists[0]
 	}
 
 	return track.buildTrack(), nil
 }
-
 func PlaylistInfo(url string) ([]Track, error) {
-	playlistPattern := `^https:\/\/open\.spotify\.com\/playlist\/[a-zA-Z0-9]{22}\?si=[a-zA-Z0-9]{16}$`
-	if !isValidPattern(url, playlistPattern) {
-		return nil, errors.New("invalid playlist url")
-	}
+    playlistPattern := `^https:\/\/open\.spotify\.com\/playlist\/[a-zA-Z0-9]{22}(\?.*)?$`
+    if !isValidPattern(url, playlistPattern) {
+        return nil, errors.New("invalid playlist url")
+    }
 
-	totalCount := "data.playlistV2.content.totalCount"
-	itemsArray := "data.playlistV2.content.items"
-	tracks, err := resourceInfo(url, "playlist", totalCount, itemsArray)
-	if err != nil {
-		return nil, err
-	}
+    id := getID(url)
+    // Use market=IN as requested
+    endpoint := fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/tracks?market=IN", id)
+    fmt.Printf("%s\n", endpoint)
 
-	return tracks, nil
+    statusCode, jsonResponse, err := request(endpoint)
+    if err != nil {
+        return nil, fmt.Errorf("error on getting playlist info: %w", err)
+    }
+    if statusCode != 200 {
+        return nil, fmt.Errorf("received non-200 status code: %d", statusCode)
+    }
+
+    // Parse tracks from the response
+    var tracks []Track
+    items := gjson.Get(jsonResponse, "items").Array()
+    for _, item := range items {
+        track := item.Get("track")
+        title := track.Get("name").String()
+        album := track.Get("album.name").String()
+        duration := int(track.Get("duration_ms").Int() / 1000)
+        var artists []string
+        for _, artist := range track.Get("artists").Array() {
+            artists = append(artists, artist.Get("name").String())
+        }
+        mainArtist := ""
+        if len(artists) > 0 {
+            mainArtist = artists[0]
+        }
+        tracks = append(tracks, Track{
+            Title:    title,
+            Album:    album,
+            Duration: duration,
+            Artists:  artists,
+            Artist:   mainArtist,
+        })
+    }
+
+    return tracks, nil
 }
-
 func AlbumInfo(url string) ([]Track, error) {
-	albumPattern := `^https:\/\/open\.spotify\.com\/album\/[a-zA-Z0-9-]{22}\?si=[a-zA-Z0-9_-]{22}$`
-	if !isValidPattern(url, albumPattern) {
-		return nil, errors.New("invalid album url")
-	}
+    albumPattern := `^https:\/\/open\.spotify\.com\/album\/[a-zA-Z0-9]{22}(\?.*)?$`
+    if !isValidPattern(url, albumPattern) {
+        return nil, errors.New("invalid album url")
+    }
 
-	totalCount := "data.albumUnion.discs.items.0.tracks.totalCount"
-	itemsArray := "data.albumUnion.discs.items"
-	tracks, err := resourceInfo(url, "album", totalCount, itemsArray)
-	if err != nil {
-		return nil, err
-	}
+    id := getID(url)
+    // Use market=IN as requested
+    endpoint := fmt.Sprintf("https://api.spotify.com/v1/albums/%s/tracks?market=IN", id)
+    fmt.Printf("%s\n", endpoint)
 
-	return tracks, nil
+    statusCode, jsonResponse, err := request(endpoint)
+    if err != nil {
+        return nil, fmt.Errorf("error on getting album info: %w", err)
+    }
+    if statusCode != 200 {
+        return nil, fmt.Errorf("received non-200 status code: %d", statusCode)
+    }
+
+    // Parse tracks from the response
+    var tracks []Track
+    items := gjson.Get(jsonResponse, "items").Array()
+    for _, item := range items {
+        title := item.Get("name").String()
+        album := "" // Album name is not in the track object here, you can fetch it separately if needed
+        duration := int(item.Get("duration_ms").Int() / 1000)
+        var artists []string
+        for _, artist := range item.Get("artists").Array() {
+            artists = append(artists, artist.Get("name").String())
+        }
+        mainArtist := ""
+        if len(artists) > 0 {
+            mainArtist = artists[0]
+        }
+        tracks = append(tracks, Track{
+            Title:    title,
+            Album:    album,
+            Duration: duration,
+            Artists:  artists,
+            Artist:   mainArtist,
+        })
+    }
+
+    return tracks, nil
 }
-
 /* returns playlist/album slice of tracks */
 func resourceInfo(url, resourceType, totalCount, itemList string) ([]Track, error) {
 	id := getID(url)
