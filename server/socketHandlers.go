@@ -35,7 +35,7 @@ func downloadStatus(statusType, message string) string {
 func handleTotalSongs(socket socketio.Conn) {
 	logger := utils.GetLogger()
 	ctx := context.Background()
-
+	print("handleTotalSongs called\n")
 	db, err := db.NewDBClient()
 	if err != nil {
 		err := xerrors.New(err)
@@ -57,7 +57,7 @@ func handleTotalSongs(socket socketio.Conn) {
 func handleSongDownload(socket socketio.Conn, spotifyURL string) {
 	logger := utils.GetLogger()
 	ctx := context.Background()
-
+	logger.Info("handleSongDownload called", slog.String("spotifyURL", spotifyURL))
 	// Handle album download
 	if strings.Contains(spotifyURL, "album") {
 		tracksInAlbum, err := spotify.AlbumInfo(spotifyURL)
@@ -182,7 +182,7 @@ func handleSongDownload(socket socketio.Conn, spotifyURL string) {
 func handleNewRecording(socket socketio.Conn, recordData string) {
 	logger := utils.GetLogger()
 	ctx := context.Background()
-
+	print("handleNewRecording called\n" + recordData + "\n")
 	var recData models.RecordData
 	if err := json.Unmarshal([]byte(recordData), &recData); err != nil {
 		err := xerrors.New(err)
@@ -219,7 +219,7 @@ func handleNewRecording(socket socketio.Conn, recordData string) {
 func handleNewFingerprint(socket socketio.Conn, fingerprintData string) {
 	logger := utils.GetLogger()
 	ctx := context.Background()
-
+	print("handleNewFingerprint called\n" + fingerprintData + "\n")
 	var data struct {
 		Fingerprint map[uint32]uint32 `json:"fingerprint"`
 	}
